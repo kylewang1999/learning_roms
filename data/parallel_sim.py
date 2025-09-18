@@ -5,7 +5,7 @@
 ##
 
 # standard imports
-import os, sys
+import os, sys, os.path as osp
 import numpy as np
 import time
 from dataclasses import dataclass
@@ -33,6 +33,10 @@ from rl.envs.biped_basic_env import BipedBasicEnv
 from rl.envs.hopper_env import HopperEnv
 from rl.envs.paddle_ball_env import PaddleBallEnv
 from rl.algorithms.ppo_play import PPO_Play
+
+
+def get_gitmodule_root():
+    return osp.dirname(osp.dirname(osp.abspath(__file__)))
 
 
 ##################################################################################
@@ -508,7 +512,7 @@ if __name__ == "__main__":
     # v_ub = jnp.array([ 5.0,  6.0])
 
     env_name = "acrobot"
-    params_path = "./rl/policy/acrobot_policy.pkl"
+    params_path = osp.join(get_gitmodule_root(), "rl/policy/acrobot_policy.pkl")
     q_lb = jnp.array([-jnp.pi, -jnp.pi])  # acrobot
     q_ub = jnp.array([ jnp.pi,  jnp.pi])  
     v_lb = jnp.array([-3.0, -3.0])  
