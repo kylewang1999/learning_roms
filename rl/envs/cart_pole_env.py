@@ -1,4 +1,5 @@
 # jax imports
+import os, os.path as osp
 import jax
 import jax.numpy as jnp
 from brax.envs.base import PipelineEnv, State
@@ -9,6 +10,9 @@ from brax import envs
 # mujoco imports
 import mujoco
 
+def get_gitmodule_root():
+    return osp.dirname(osp.dirname(osp.dirname(osp.abspath(__file__))))
+
 
 # struct to hold the configuration parameters
 @struct.dataclass
@@ -16,7 +20,7 @@ class CartPoleConfig:
     """Config dataclass for cart-pole."""
 
     # model path (NOTE: relative the script that calls this class)
-    model_path: str = "./models/cart_pole.xml"
+    model_path: str = osp.join(get_gitmodule_root(), "models/cart_pole.xml")
 
     # number of "simulation steps" for every control input
     physics_steps_per_control_step: int = 1
