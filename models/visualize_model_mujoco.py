@@ -11,16 +11,15 @@ import numpy as np
 # Load the model from XML
 # xml_file = "./models/cart_pole.xml"
 # xml_file = "./models/acrobot.xml"
-# xml_file = "./models/biped.xml"
-# xml_file = "./models/humanoid.xml"
 xml_file = "./models/paddle_ball.xml"
 # xml_file = "./models/hopper.xml"
+# xml_file = "./models/biped.xml"
 
 # load and launch the model
 model =  mujoco.MjModel.from_xml_path(xml_file)
 data = mujoco.MjData(model)
 
-# set teh print precision
+# set the print precision
 np.set_printoptions(precision=4, suppress=True)
 
 # print some info about the model
@@ -48,7 +47,12 @@ print("\nNumber of actuators:", model.nu)
 for i in range(model.nu):
     name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_ACTUATOR, i)
     atype = model.actuator_trntype[i]  # transmission type
+    lower, upper = model.actuator_ctrlrange[i]
+    gear = model.actuator_gear[i, 0]
     print(f"    Actuator {i} name:", name)
+    print(f"    Actuator {i} transmission type:", atype)
+    print(f"    Control limits: [{lower:.4f}, {upper:.4f}]")
+    print(f"    Gear ratio: {gear}")
 
 # bodies
 print("\nNumber of bodies:", model.nbody)

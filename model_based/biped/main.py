@@ -20,6 +20,7 @@ class Controller:
         # load the model file
         model = mujoco.MjModel.from_xml_path(model_file)
         self.model = model
+        sim_dt = model.opt.timestep
 
         # create indexing object
         self.idx = Biped_IDX()
@@ -31,7 +32,7 @@ class Controller:
         self.ik = InverseKinematics(model_file)
 
         # gains (NOTE: these does not take gear reduction into account)
-        self.kp = np.array([150.0, 150.0, 150.0, 150.0])
+        self.kp = np.array([200.0, 200.0, 200.0, 200.0])
         self.kd = np.array([5.0, 5.0, 5.0, 5.0])
 
         # get foot locations
@@ -47,6 +48,10 @@ class Controller:
         self.gear_ratio_LK = model.actuator_gear[LK_actuator_id, 0]
         self.gear_ratio_RH = model.actuator_gear[RH_actuator_id, 0]
         self.gear_ratio_RK = model.actuator_gear[RK_actuator_id, 0]
+
+        # cache sensor IDs
+        self.sid_left_foot  = model.sensor("left_foot_touch").id
+        self.sid_right_foot = model.sensor("right_foot_touch").id
 
         # internal state and time
         self.time = 0.0
@@ -101,10 +106,10 @@ class Controller:
         self.Kd_raibert = 0.2
 
         # max step increment
-        self.u_max = 0.3
+        self.u_max = 0.4
 
         # feedforward bias input for stepping
-        self.u_bias = -0.035
+        self.u_bias = -0.025
 
         # which foot stepping controller to use
         self.foot_placement_ctrl = "LIP"   # "Raibert" or "LIP"
@@ -113,9 +118,13 @@ class Controller:
         # velocity command parameters
         self.vx_cmd_scale = 0.4    # m/s per unit joystick command
         self.vx_cmd = 0.0          # desired forward velocity (used with joystick if connected)
+        
+        # low pass filter
+        f_cutoff = 0.3
+        omega_c = 2.0 * np.pi * f_cutoff
+        self.vx_cmd_alpha = np.exp(-omega_c * sim_dt)
         self.vx_cmd_prev = 0.0    
         self.vx_cmd_curr = 0.0    
-        self.vx_cmd_alpha = 0.01   # low-pass filter, (very low b/c fast control loop)
 
     # update internal state and time
     def update_state(self, data):
@@ -222,8 +231,8 @@ class Controller:
             self.vx_cmd_curr = self.vx_cmd_scale * vx_cmd_raw
 
             # low-pass filter
-            self.vx_cmd = (  self.vx_cmd_alpha * self.vx_cmd_curr 
-                           + (1.0 - self.vx_cmd_alpha) * self.vx_cmd_prev)
+            self.vx_cmd = (  (1.0 - self.vx_cmd_alpha) * self.vx_cmd_curr 
+                           + self.vx_cmd_alpha* self.vx_cmd_prev)
             self.vx_cmd_prev = self.vx_cmd
 
             # deadband
@@ -374,6 +383,9 @@ class Controller:
         # update the joystick command
         self.update_joystick_command()
 
+        # print contact info
+        self.parse_contact(data)
+
         # compute desired foot positions and velocities
         p_left_des_W, p_right_des_W, v_left_des_W, v_right_des_W = self.compute_foot_targets()
         p_left_des_W = p_left_des_W.reshape(2,1)
@@ -410,6 +422,24 @@ class Controller:
 
         return tau
 
+    # parse contact information
+    def parse_contact(self, data):
+
+        # read the sensor values
+        left_foot_force  = data.sensordata[self.sid_left_foot]
+        right_foot_force = data.sensordata[self.sid_right_foot]
+
+        # thresholds avoid noise
+        left_foot_in_contact  = left_foot_force  > 1e-6
+        right_foot_in_contact = right_foot_force > 1e-6
+
+        if left_foot_in_contact:
+            print("Left foot in contact, force: {:.3f}".format(left_foot_force))
+        if right_foot_in_contact:
+            print("Right foot in contact, force: {:.3f}".format(right_foot_force))
+
+        return left_foot_in_contact, right_foot_in_contact
+    
 
 ##################################################################################
 

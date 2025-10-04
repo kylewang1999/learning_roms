@@ -32,6 +32,7 @@ from rl.envs.biped_env import BipedEnv
 from rl.envs.biped_basic_env import BipedBasicEnv
 from rl.envs.hopper_env import HopperEnv
 from rl.envs.paddle_ball_env import PaddleBallEnv
+from rl.algorithms.custom_networks import BraxPPONetworksWrapper, MLP
 from rl.algorithms.ppo_play import PPO_Play
 
 
@@ -64,7 +65,7 @@ class ParallelSim():
     """
 
     # initialize the class
-    def __init__(self, config: ParallelSimConfig):
+    def __init__(self, config: ParallelSimConfig, sim_dt_des = None):
 
         # assign the random seed
         self.rng = config.rng
@@ -79,9 +80,20 @@ class ParallelSim():
         # load the dontrol decimation (number of sim steps per control step)
         self.control_decimation = env_config.physics_steps_per_control_step
 
+        # load the desired sim dt
+        if sim_dt_des is not None:
+            self.sim_dt = float(sim_dt_des)
+        else:
+            self.sim_dt = None
+
         # load the mujoco model for parallel sim
         model_path = env_config.model_path
-        self.initialize_model(model_path)
+        mj_model = mujoco.MjModel.from_xml_path(model_path)
+        mj_data = mujoco.MjData(mj_model)
+        self.initialize_model(mj_model, mj_data, model_path)
+
+        # load in the touch sensors if any
+        self.initialize_touch_sensors(mj_model)
 
         # policy and observation function
         if config.policy_params_path is not None:
@@ -104,25 +116,35 @@ class ParallelSim():
         )
 
         # zeros vector to use with zero input rollouts
-        self.u_zero = jnp.zeros((batch_size, self.nu), dtype=jnp.float32)  # (batch, nu) zeros
+        self.u_zero = jnp.zeros((self.batch_size, self.nu), dtype=jnp.float32)  # (batch, nu) zeros
 
         # sampling bounds. Should be [-1.0, 1.0] for all models beause of how XML is set up
         self.u_lb = -jnp.ones((self.nu,), dtype=jnp.float32)  # lower bound is -1.0, shape (nu,)
         self.u_ub =  jnp.ones((self.nu,), dtype=jnp.float32)  # upper bound is  1.0, shape (nu,)
 
+    ######################################### INITIALIZATION #########################################
 
     # initialize model
-    def initialize_model(self, model_path):
+    def initialize_model(self, mj_model, mj_data, model_path):
         """
         Initialize the mujoco model and data for parallel rollout.
         
         Args:
-            model_path: str, path to the mujoco model xml file
+            mj_model: mujoco.MjModel, the mujoco model
+            mj_data: mujoco.MjData, the mujoco data
         """
+        # original simulation timestep
+        original_sim_dt = float(mj_model.opt.timestep)
 
-        # import the mujoco model
-        mj_model = mujoco.MjModel.from_xml_path(model_path)
-        mj_data = mujoco.MjData(mj_model)
+        # overwrite the simulation time step of the mujoco XML if one is specified
+        if self.sim_dt is not None:
+            mj_model.opt.timestep = self.sim_dt
+
+        # check that control dt is integer multiple of sim dt
+        sim_dt = float(mj_model.opt.timestep)
+        ctrl_dt = float(original_sim_dt * self.control_decimation)
+        if (ctrl_dt / sim_dt) % 1.0 != 0.0:
+            raise ValueError(f"Sim dt ({sim_dt}) is not integer multiple of Control dt ({ctrl_dt}) .")
 
         # put the model and data on GPU
         self.mjx_model = mjx.put_model(mj_model)
@@ -146,6 +168,22 @@ class ParallelSim():
         print(f"   nv: {self.nv}")
         print(f"   nu: {self.nu}")
 
+    # initialize touch sensors
+    def initialize_touch_sensors(self, mj_model):
+        """
+        Initialize touch sensors if any are present in the model.
+
+        Args:
+            mj_model: mujoco.MjModel, the mujoco model
+        """
+        
+        # cache touch sensor IDs
+        self.touch_sensor_ids = [
+            i for i, stype in enumerate(mj_model.sensor_type)
+            if stype == mujoco.mjtSensor.mjSENS_TOUCH
+        ]
+        self.nc = len(self.touch_sensor_ids)
+        print(f"Found {self.nc} touch sensors: {self.touch_sensor_ids}")
 
     # initialize the policy and observation functions
     def initialize_policy_and_obs_fn(self, policy_params_path):
@@ -196,6 +234,8 @@ class ParallelSim():
                                                static_argnames=('T',),
                                                donate_argnums=(0, 1))
 
+
+    ######################################### SAMPLING #########################################
 
     # sample initial conditions
     def sample_random_uniform_initial_conditions(self):
@@ -259,16 +299,16 @@ class ParallelSim():
             q_log: jnp.array, logged positions (batch_size, T, nq)
             v_log: jnp.array, logged velocities (batch_size, T, nv)
             u_log: jnp.array, logged inputs (batch_size, T-1, nu) (all zeros)
+            c_log: jnp.array, logged contacts (batch_size, T-1, nc) 
         """
     
         # sample initial conditions
         q0_batch, v0_batch = self.sample_random_uniform_initial_conditions()
 
         # perform rollout
-        q_log, v_log, u_log = self.rollout_zero_input_jit(q0_batch, v0_batch, T)
+        q_log, v_log, u_log, c_log = self.rollout_zero_input_jit(q0_batch, v0_batch, T)
 
-        # perform rollout
-        return q_log, v_log, u_log
+        return q_log, v_log, u_log, c_log
 
     # rollout with zero input sequence (pure function to jit)
     def _rollout_zero_input(self, q0_batch, v0_batch, T):
@@ -282,6 +322,7 @@ class ParallelSim():
             q_log: jnp.array, logged positions (batch_size, T, nq)
             v_log: jnp.array, logged velocities (batch_size, T, nv)
             u_log: jnp.array, logged inputs (batch_size, T-1, nu) (all zeros)
+            c_log: jnp.array, logged contacts (batch_size, T-1, nc)
         """
 
         # number of integration steps
@@ -299,23 +340,31 @@ class ParallelSim():
             # take a step
             data = self.step_fn_batched(data)
 
-            return data, (data.qpos, data.qvel)
+            # extract contact pairs
+            contact = self.parse_contact(data)
+
+            return data, (data.qpos, data.qvel, contact)
 
         # forward propagation
-        data_last, (q_log, v_log) = lax.scan(body, data_0, None, length=S)
+        data_last, (q_log, v_log, c_log) = lax.scan(body, data_0, None, length=S)
 
         # add the initial condition to the logs
         q0 = data_0.qpos   # initial q
         v0 = data_0.qvel   # initial v
+        c0 = self.parse_contact(data_0)  # initial contact
         q_log = jnp.concatenate((q0[None, :, :], q_log), axis=0)  # shape (T, batch_size, nq)
         v_log = jnp.concatenate((v0[None, :, :], v_log), axis=0)  # shape (T, batch_size, nv)
+        c_log = jnp.concatenate((c0[None, :, :], c_log), axis=0)   # (T, batch, nc)
 
         # swap axis to get (batch_size, T, dim)
         q_log  = jnp.swapaxes(q_log, 0, 1)  # shape (batch_size, T, nq)
         v_log  = jnp.swapaxes(v_log, 0, 1)  # shape (batch_size, T, nv)
+        c_log  = jnp.swapaxes(c_log, 0, 1)  # shape (batch_size, T, nc)
+
+        # u_log is all zeros
         u_log = jnp.broadcast_to(self.u_zero[:, None, :], (self.batch_size, S, self.nu)) # shape (batch_size, T-1, nu)
 
-        return q_log, v_log, u_log
+        return q_log, v_log, u_log, c_log
     
 
     ######################################### POLICY INPUT ROLLOUT #########################################
@@ -341,10 +390,10 @@ class ParallelSim():
         q0_batch, v0_batch = self.sample_random_uniform_initial_conditions()
 
         # perform rollout
-        q_log, v_log, u_log = self.rollout_policy_input_jit(q0_batch, v0_batch, T)
+        q_log, v_log, u_log, c_log = self.rollout_policy_input_jit(q0_batch, v0_batch, T)
 
         # perform rollout
-        return q_log, v_log, u_log
+        return q_log, v_log, u_log, c_log
 
     # rollout closed loop using RL policy (pure function to jit)
     def _rollout_policy_input(self, q0_batch, v0_batch, T):
@@ -358,6 +407,7 @@ class ParallelSim():
             q_log: jnp.array, logged positions (batch_size, T, nq)
             v_log: jnp.array, logged velocities (batch_size, T, nv)
             u_log: jnp.array, logged inputs (batch_size, T-1, nu)
+            c_log: jnp.array, logged contact pairs (batch_size, T, nc)
         """
 
         # number of integration steps
@@ -390,23 +440,29 @@ class ParallelSim():
             data = data.replace(ctrl=u_next)
             data = self.step_fn_batched(data)
 
-            return (data, u_next, t + 1), (data.qpos, data.qvel, u_next)
+            # extract contact pairs
+            contact = self.parse_contact(data)
+
+            return (data, u_next, t + 1), (data.qpos, data.qvel, u_next, contact)
 
         # do the forward propagation
-        (data_last, u_last, _), (q_log, v_log, u_log) = lax.scan(body, (data_0, u0, 0), None, length=S)
+        (data_last, u_last, _), (q_log, v_log, u_log, c_log) = lax.scan(body, (data_0, u0, 0), None, length=S)
 
         # add the initial condition to the logs
         q0 = data_0.qpos   # initial q
-        v0 = data_0.qvel   # initial v
-        q_log = jnp.concatenate((q0[None, :, :], q_log), axis=0)  # shape (T, batch_size, nq)
-        v_log = jnp.concatenate((v0[None, :, :], v_log), axis=0)  # shape (T, batch_size, nv)
+        v0 = data_0.qvel   # initial v 
+        c0 = self.parse_contact(data_0)  # initial contact
+        q_log = jnp.concatenate((q0[None, :, :], q_log), axis=0)     # shape (T, batch_size, nq)
+        v_log = jnp.concatenate((v0[None, :, :], v_log), axis=0)     # shape (T, batch_size, nv)
+        c_log = jnp.concatenate((c0[None, ...], c_log), axis=0)  # (T, batch_size, nc)
 
         # swap axis to get (batch, T, dim)
         q_log  = jnp.swapaxes(q_log, 0, 1)  # shape (batch_size, T, nq)
         v_log  = jnp.swapaxes(v_log, 0, 1)  # shape (batch_size, T, nv)
         u_log  = jnp.swapaxes(u_log, 0, 1)  # shape (batch_size, T-1, nu)
+        c_log = jnp.swapaxes(c_log, 0, 1)  # (batch_size, T, nc)
 
-        return q_log, v_log, u_log
+        return q_log, v_log, u_log, c_log
 
 
     ######################################### RANDOM INPUT ROLLOUT #########################################
@@ -421,6 +477,7 @@ class ParallelSim():
             q_log: jnp.array, logged positions (batch_size, T, nq)
             v_log: jnp.array, logged velocities (batch_size, T, nv)
             u_log: jnp.array, logged inputs (batch_size, T-1, nu)
+            c_log: jnp.array, logged contact forces (batch_size, T, nc)
         """
     
         # sample initial conditions
@@ -430,10 +487,10 @@ class ParallelSim():
         u_seq_batch = self.sample_random_uniform_inputs(T-1)
 
         # perform rollout
-        q_log, v_log, u_log = self.rollout_random_input_jit(q0_batch, v0_batch, u_seq_batch, T)
+        q_log, v_log, u_log, c_log = self.rollout_random_input_jit(q0_batch, v0_batch, u_seq_batch, T)
 
         # perform rollout
-        return q_log, v_log, u_log
+        return q_log, v_log, u_log, c_log
 
     # rollout with random input sequence (pure function to jit)
     def _rollout_random_input(self, q0_batch, v0_batch, u_seq_batch, T):
@@ -447,7 +504,8 @@ class ParallelSim():
         Returns:
             q_log: jnp.array, logged positions (batch_size, T, nq)
             v_log: jnp.array, logged velocities (batch_size, T, nv)
-            u_log: jnp.array, logged inputs (batch_size, T-1, nu) 
+            u_log: jnp.array, logged inputs (batch_size, T-1, nu)
+            c_log: jnp.array, logged contact forces (batch_size, T, nc)
         """
 
         # number of integration steps
@@ -466,25 +524,54 @@ class ParallelSim():
             data = data.replace(ctrl=u_t)
             data = self.step_fn_batched(data)
 
-            return data, (data.qpos, data.qvel, u_t)
+            # extract contact pairs
+            contact = self.parse_contact(data)
+
+            return data, (data.qpos, data.qvel, u_t, contact)
 
         # forward propagation
-        data_last, (q_log, v_log, u_log) = lax.scan(body, data_0, u_seq_batch_swapped, length=S)
+        data_last, (q_log, v_log, u_log, c_log) = lax.scan(body, data_0, u_seq_batch_swapped, length=S)
 
         # add the initial condition to the logs
         q0 = data_0.qpos   # initial q
         v0 = data_0.qvel   # initial v
+        c0 = self.parse_contact(data_0)  # initial contact
         q_log = jnp.concatenate((q0[None, :, :], q_log), axis=0)  # shape (T, batch_size, nq)
         v_log = jnp.concatenate((v0[None, :, :], v_log), axis=0)  # shape (T, batch_size, nv)
+        c_log = jnp.concatenate((c0[None, :, :], c_log), axis=0)  # shape (T, batch_size, nc)
 
         # swap axis to get (batch_size, T, dim)
         q_log  = jnp.swapaxes(q_log, 0, 1)  # shape (batch_size, T, nq)
         v_log  = jnp.swapaxes(v_log, 0, 1)  # shape (batch_size, T, nv)
+        c_log  = jnp.swapaxes(c_log, 0, 1)  # shape (batch_size, T, nc)
+
+        # the input log is just the input sequence
         u_log  = u_seq_batch                # shape (batch_size, T-1, nu)
 
-        return q_log, v_log, u_log
+        return q_log, v_log, u_log, c_log
+    
+    
+    ######################################### UTILS #########################################
 
+    def parse_contact(self, data_batch):
+        """
+        Extract touch sensor values for a batch of mjx.Data.
 
+        Args:
+            data_batch: mjx.Data, batched mjx data (batch_size, ...)
+
+        Returns:
+            jnp.ndarray, shape (batch_size, nc)
+            Contact forces at each touch sensor site.
+        """
+        if self.nc == 0:
+            # no touch sensors defined
+            return jnp.zeros((self.batch_size, 0), dtype=jnp.float32)
+        
+        # data_batch.sensordata has shape (batch_size, nsensor)
+        return data_batch.sensordata[:, self.touch_sensor_ids]
+       
+        
 ##################################################################################
 # EXAMPLE USAGE
 ##################################################################################
@@ -492,38 +579,41 @@ class ParallelSim():
 
 if __name__ == "__main__":
 
+    # print the device being used (gpu or cpu)
+    device = jax.devices()[0]
+    print("Device type:", device.platform)      # e.g. 'gpu' or 'cpu'
+    print("Device name:", device.device_kind)   # e.g. 'NVIDIA GeForce RTX 4090'
+
     # create a random number generator
-    seed = int(time.time())
     # seed = 0
+    seed = int(time.time())
     rng = jax.random.PRNGKey(seed)
 
     # choose batch size
-    batch_size = 2048
+    batch_size = 1024
+
+    # overwrite the simulation dt to a desired one
+    # NOTE: This overwrites the model XML timestep so 
+    #       that we get smoother trajectories across the board.
+    sim_dt_des = 0.001  # set to None if you want to use the default model XML timestep
 
     # trajectory length
-    T = 1000
+    T = 4000
 
     # choose environment, policy parameters, and state space bounds
-    env_name = "cart_pole"
-    params_path = osp.join(get_gitmodule_root(), "rl/policy/cart_pole_policy.pkl")
-    q_lb = jnp.array([-1.0, -jnp.pi])  # cartpole
-    q_ub = jnp.array([ 1.0,  jnp.pi])  
-    v_lb = jnp.array([-5.0, -6.0])  
-    v_ub = jnp.array([ 5.0,  6.0])
+    # env_name = "cart_pole"
+    # params_path = osp.join(get_gitmodule_root(), "rl/policy/cart_pole_policy.pkl")
+    # q_lb = jnp.array([-1.0, -jnp.pi])  # cartpole
+    # q_ub = jnp.array([ 1.0,  jnp.pi])  
+    # v_lb = jnp.array([-5.0, -6.0])  
+    # v_ub = jnp.array([ 5.0,  6.0])
 
-    # env_name = "acrobot"
-    # params_path = osp.join(get_gitmodule_root(), "rl/policy/acrobot_policy.pkl")
-    # q_lb = jnp.array([-jnp.pi, -jnp.pi])  # acrobot
-    # q_ub = jnp.array([ jnp.pi,  jnp.pi])  
-    # v_lb = jnp.array([-3.0, -3.0])  
-    # v_ub = jnp.array([ 3.0,  3.0])
-
-    # env_name = "paddle_ball"
-    # params_path = "./rl/policy/paddle_ball_policy.pkl"
-    # q_lb = jnp.array([ 1.0,  0.1]) # paddle ball
-    # q_ub = jnp.array([ 3.0,  0.9])
-    # v_lb = jnp.array([-5.0, -5.0])
-    # v_ub = jnp.array([ 5.0,  5.0])
+    env_name = "paddle_ball"
+    params_path = "./rl/policy/paddle_ball_policy.pkl"
+    q_lb = jnp.array([ 1.0,  0.1]) # paddle ball
+    q_ub = jnp.array([ 3.0,  0.9])
+    v_lb = jnp.array([-5.0, -5.0])
+    v_ub = jnp.array([ 5.0,  5.0])
 
     # env_name = "hopper"
     # params_path = "./rl/policy/hopper_policy.pkl"
@@ -543,7 +633,7 @@ if __name__ == "__main__":
                                policy_params_path=params_path)
     
     # create the rollout instance
-    r = ParallelSim(config)
+    r = ParallelSim(config, sim_dt_des)
 
     # choose the type of rollout
     # rollout_fn = r.rollout_zero_input
@@ -552,65 +642,57 @@ if __name__ == "__main__":
 
     # rollout with chosen inputs
     time_0 = time.time()
-    q_log_1, v_log_1, u_log_1 = rollout_fn(T)
+    q_log_1, v_log_1, u_log_1, c_log_1 = rollout_fn(T)
     q_log_1.block_until_ready()
     v_log_1.block_until_ready()
     u_log_1.block_until_ready()
+    c_log_1.block_until_ready()
     time_1 = time.time()
-    print(f"Rollout with chosen inputs took (first): {(time_1-time_0):.3f}s")
+    print(f"Rollout with chosen inputs took (jitting): {(time_1-time_0):.3f}s")
 
     time_0 = time.time()
-    q_log_2, v_log_2, u_log_2 = rollout_fn(T)
+    q_log_2, v_log_2, u_log_2, c_log_2 = rollout_fn(T)
     q_log_2.block_until_ready()
     v_log_2.block_until_ready()
     u_log_2.block_until_ready()
+    c_log_2.block_until_ready()
     time_1 = time.time()
     print(f"Rollout with chosen inputs took (steady): {(time_1-time_0):.3f}s")
 
     time_0 = time.time()
-    q_log_3, v_log_3, u_log_3 = rollout_fn(T)
+    q_log_3, v_log_3, u_log_3, c_log_3 = rollout_fn(T)
     q_log_3.block_until_ready()
     v_log_3.block_until_ready()
     u_log_3.block_until_ready()
-    time_1 = time.time()
-    print(f"Rollout with chosen inputs took (steady): {(time_1-time_0):.3f}s")
-
-    time_0 = time.time()
-    q_log_4, v_log_4, u_log_4 = rollout_fn(T)
-    q_log_4.block_until_ready()
-    v_log_4.block_until_ready()
-    u_log_4.block_until_ready()
-    time_1 = time.time()
-    print(f"Rollout with chosen inputs took (steady): {(time_1-time_0):.3f}s")
-
-    time_0 = time.time()
-    q_log_5, v_log_5, u_log_5 = rollout_fn(T)
-    q_log_5.block_until_ready()
-    v_log_5.block_until_ready()
-    u_log_5.block_until_ready()
+    c_log_3.block_until_ready()
     time_1 = time.time()
     print(f"Rollout with chosen inputs took (steady): {(time_1-time_0):.3f}s")
 
     print(f"q_log_1 shape: {q_log_1.shape}")
     print(f"v_log_1 shape: {v_log_1.shape}")
     print(f"u_log_1 shape: {u_log_1.shape}")
+    print(f"c_log_1 shape: {c_log_1.shape}")
     print(f"q_log_2 shape: {q_log_2.shape}")
     print(f"v_log_2 shape: {v_log_2.shape}")
     print(f"u_log_2 shape: {u_log_2.shape}")
+    print(f"c_log_2 shape: {c_log_2.shape}")
     print(f"q_log_3 shape: {q_log_3.shape}")
     print(f"v_log_3 shape: {v_log_3.shape}")
     print(f"u_log_3 shape: {u_log_3.shape}")
-
+    print(f"c_log_3 shape: {c_log_3.shape}")
 
     q_log_1 = np.array(q_log_1)
     v_log_1 = np.array(v_log_1)
     u_log_1 = np.array(u_log_1)
+    c_log_1 = np.array(c_log_1)
     q_log_2 = np.array(q_log_2)
     v_log_2 = np.array(v_log_2)
     u_log_2 = np.array(u_log_2)
+    c_log_2 = np.array(c_log_2)
     q_log_3 = np.array(q_log_3)
     v_log_3 = np.array(v_log_3)
     u_log_3 = np.array(u_log_3)
+    c_log_3 = np.array(c_log_3)
     
     q_err_1 = np.linalg.norm(q_log_1 - q_log_2)
     q_err_2 = np.linalg.norm(q_log_2 - q_log_3)
@@ -621,23 +703,34 @@ if __name__ == "__main__":
     u_err_1 = np.linalg.norm(u_log_1 - u_log_2)
     u_err_2 = np.linalg.norm(u_log_2 - u_log_3)
     u_err_3 = np.linalg.norm(u_log_1 - u_log_3)
+    c_err_1 = np.linalg.norm(c_log_1 - c_log_2)
+    c_err_2 = np.linalg.norm(c_log_2 - c_log_3)
+    c_err_3 = np.linalg.norm(c_log_1 - c_log_3)
 
+    # want the error to be non zero -- means I have unique trajectories
     print(f"q_err_1: {q_err_1:.6e}, q_err_2: {q_err_2:.6e}, q_err_3: {q_err_3:.6e}")
     print(f"v_err_1: {v_err_1:.6e}, v_err_2: {v_err_2:.6e}, v_err_3: {v_err_3:.6e}")
     print(f"u_err_1: {u_err_1:.6e}, u_err_2: {u_err_2:.6e}, u_err_3: {u_err_3:.6e}")
-
+    print(f"c_err_1: {c_err_1:.6e}, c_err_2: {c_err_2:.6e}, c_err_3: {c_err_3:.6e}")
 
     # save the data
-    q_log_np = np.array(q_log_1)
-    v_log_np = np.array(v_log_1)
-    u_log_np = np.array(u_log_1)
+    q_log_np = np.array(q_log_3)
+    v_log_np = np.array(v_log_3)
+    u_log_np = np.array(u_log_3)
+    c_log_np = np.array(c_log_3)
 
     print(q_log_np.shape)
     print(v_log_np.shape)
     print(u_log_np.shape)
+    print(c_log_np.shape)
 
     # save the data
     robot_name = r.env.robot_name
     save_path = f"./data/{robot_name}_data.npz"
-    np.savez(save_path, q_traj=q_log_np, v_traj=v_log_np, u_traj=u_log_np)
+    np.savez(save_path, 
+             sim_dt=float(r.sim_dt), 
+             q_log=q_log_np, 
+             v_log=v_log_np, 
+             u_log=u_log_np, 
+             c_log=c_log_np)
     print(f"Saved data to: {save_path}")

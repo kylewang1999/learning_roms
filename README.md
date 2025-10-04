@@ -36,7 +36,10 @@ pip install mujoco-mjx
 ## Brax
 Used for reinforcement learning.
 
-Install BRAX via instructions: ```https://github.com/google/brax```
+Install BRAX via instructions: ```https://github.com/google/brax```, for example:
+```bash
+pip install brax
+```
 
 ## Tensorboard
 Used for logging RL progress.
@@ -62,3 +65,11 @@ OR
 ```bash
 pip install pygame
 ```
+
+# Usage
+Haven't tested this extensively, but if you want to bypass using the GPU, you can run a script like this:
+```bash
+# tell JAX to use CPU and ignore all GPUs
+CUDA_VISIBLE_DEVICES="" JAX_PLATFORMS=cpu /home/sergio/miniconda3/envs/env_rom/bin/python   /home/sergio/projects/LearningROMs/data/parallel_sim.py
+```
+Here you ask to not see any GPUs, tell jax to use the CPU, use the conda env python, and run a python scipt.

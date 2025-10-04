@@ -24,60 +24,102 @@ from rl.envs.paddle_ball_env import PaddleBallEnv
 from rl.algorithms.ppo_play import PPO_Play
 
 
-#################################################################
+################################################################################
+# UTILS
+################################################################################
+
+# loads every contact pair possible from the mujoco XML model
+def load_touch_sensors(mj_model):
+    """
+    Load all touch sensors from a MuJoCo model.
+
+    Args:
+        mj_model: mujoco.MjModel
+
+    Returns:
+        touch_sensor_ids: list of int, indices of touch sensors
+        touch_sensor_names: list of str, names of touch sensors
+        num_touch_sensors: int, number of touch sensors
+    """
+    touch_sensor_ids = []
+    touch_sensor_names = []
+
+    for i, stype in enumerate(mj_model.sensor_type):
+        if stype == mujoco.mjtSensor.mjSENS_TOUCH:
+            touch_sensor_ids.append(i)
+            name = mujoco.mj_id2name(mj_model, mujoco.mjtObj.mjOBJ_SENSOR, i)
+            touch_sensor_names.append(name)
+
+    num_touch_sensors = len(touch_sensor_ids)
+
+    print(f"Found {num_touch_sensors} touch sensors: {touch_sensor_names}")
+    return touch_sensor_ids, touch_sensor_names, num_touch_sensors
+
+
+################################################################################
+# MAIN PLOTTING
+################################################################################
 
 if __name__ == "__main__":
 
     # choose the environment
     # env = envs.get_environment("cart_pole")
-    env = envs.get_environment("acrobot")
-    # env = envs.get_environment("paddle_ball")
+    env = envs.get_environment("paddle_ball")
     # env = envs.get_environment("hopper")
     config = env.config
     robot_name = env.robot_name
+
+    # number of random trajectories to plot (use n_plot = 1 to see one trajectory for debugging)
+    n_plot = 20
+
+    # load the mujoco model
+    model_path = config.model_path
+    mj_model = mujoco.MjModel.from_xml_path(model_path)
+    mj_data = mujoco.MjData(mj_model)
+
+    # load touch sensors if available
+    touch_sensor_ids, touch_sensor_names, num_touch_sensors = load_touch_sensors(mj_model)
 
     # load the data
     file_name = f"./data/{robot_name}_data.npz"
     data = np.load(file_name)
 
     # access the arrays
-    q_traj = data['q_traj']
-    v_traj = data['v_traj']
-    u_traj = data['u_traj']
+    sim_dt = data['sim_dt']
+    q_traj = data['q_log']
+    v_traj = data['v_log']
+    u_traj = data['u_log']
+    c_traj = data['c_log']
 
     # get the shape of the data
     batch_size, N_state, nq = q_traj.shape
     _, _, nv = v_traj.shape
     _, N_input, nu = u_traj.shape
+    _, _, nc = c_traj.shape
 
-    print(f"batch_size: {batch_size}")
-    print(f"N_state: {N_state}")
-    print(f"N_input: {N_input}")
-    print(f"nq: {nq}")
-    print(f"nv: {nv}")
-    print(f"nu: {nu}")
+    # print log shapes
+    print(f"Simulation dt: {sim_dt}")
+    print(f"Full q_traj shape: {q_traj.shape}")
+    print(f"Full v_traj shape: {v_traj.shape}")
+    print(f"Full u_traj shape: {u_traj.shape}")
+    print(f"Full c_traj shape: {c_traj.shape}")
 
-    # percent degemnts of the trajectory to use
-    traj_segment_percent = (0.0, 0.5)  # (start, end) as percent of trajectory length
+    # percent segments of the trajectory to use
+    traj_segment_percent = (0.0, 1.0)  # (start, end) as percent of trajectory length
     start_idx = int(traj_segment_percent[0] * N_state)
     end_idx = int(traj_segment_percent[1] * N_state)
     q_traj = q_traj[:, start_idx:end_idx, :]
     v_traj = v_traj[:, start_idx:end_idx, :]
     u_traj = u_traj[:, start_idx:end_idx, :]
+    c_traj = c_traj[:, start_idx:end_idx, :]
+
     N_state = q_traj.shape[1]
     N_input = u_traj.shape[1]
     print(f"Using trajectory segment from {start_idx} to {end_idx} (N_state = {N_state})")
 
     # select one random trajectory to playback
     traj_idx = np.random.randint(batch_size)
-
     print(f"Playing back trajectory {traj_idx} of {batch_size}")
-
-    model_path = config.model_path
-    mj_model = mujoco.MjModel.from_xml_path(model_path)
-    mj_data = mujoco.MjData(mj_model)
-
-    sim_dt = env.sys.opt.timestep
 
     # wall clock timing variables
     t_sim = 0.0
@@ -106,13 +148,10 @@ if __name__ == "__main__":
             # get the current sim time and state
             t_sim = mj_data.time
 
-            # print(f"Sim Time: {t_sim:.3f} s")
-
             # fix the state
             step_idx = int(t_sim / sim_dt)
 
             if step_idx >= N_state:
-                print("Reached the end of the trajectory")
                 break
             
             # hardcode the trajectory state for playback
@@ -130,77 +169,97 @@ if __name__ == "__main__":
             if t_sim > wall_elapsed:
                 time.sleep(t_sim - wall_elapsed)
 
-    # pull another n_plot random trajectories and plot them 
-    n_plot = 20
-    n_plot = min(n_plot, batch_size)
 
-    # time vector (N steps at dt)
-    t_state = np.arange(N_state) * sim_dt
-    t_input = np.arange(N_input) * sim_dt
+    # alpha value for plotting trajectories (0 = transparent, 1 = solid)
+    alpha_traj = 0.5 
 
-    # figure and axes: nq rows, 3 cols (q, v, u)
-    fig, axes = plt.subplots(nrows=nq, ncols=3, figsize=(14, 2.2 * nq), sharex=True)
-    if nq == 1:
-        axes = axes[None, :]  # ensure 2D indexing when nq == 1
+    rng = np.random.default_rng(0)
+    idxs = rng.choice(batch_size, size=min(n_plot, batch_size), replace=False)
 
-    for i in range(nq):
-        ax_q, ax_v, ax_u = axes[i, 0], axes[i, 1], axes[i, 2]
+    # time bases
+    T_state = N_state
+    T_input = N_input if N_input > 0 else N_state
+    ctrl_dt = float(sim_dt) * (T_state / T_input)
+    t_state   = np.arange(T_state) * float(sim_dt)
+    t_input   = np.arange(T_input) * ctrl_dt
+    t_contact = t_state
 
-        # --- Column 0: q[i] ---
-        for _ in range(n_plot):
-            idx = np.random.randint(batch_size)
-            ax_q.plot(t_state, q_traj[idx, :, i], alpha=0.5)
-        ax_q.set_ylabel(f"q[{i}]")
-        ax_q.grid(True, alpha=0.3)
-        if i == 0:
-            ax_q.set_title("Positions (q)")
+    # optional contact shift (if logged post-step)
+    c_traj_plot = c_traj
 
-        # --- Column 1: v[i] (hide if i >= nv) ---
-        if i < nv:
-            for _ in range(n_plot):
-                idx = np.random.randint(batch_size)
-                ax_v.plot(t_state, v_traj[idx, :, i], alpha=0.5)
-            ax_v.set_ylabel(f"v[{i}]")
-            ax_v.grid(True, alpha=0.3)
-            if i == 0:
-                ax_v.set_title("Velocities (v)")
+    nrows = max(q_traj.shape[2], v_traj.shape[2], u_traj.shape[2], c_traj.shape[2])
+
+    fig, axes = plt.subplots(nrows=nrows, ncols=4, figsize=(18, 2.6 * nrows), sharex=True)
+    if axes.ndim == 1:
+        axes = axes[None, :]
+
+    axes[0, 0].set_title("Positions (q)")
+    axes[0, 1].set_title("Velocities (v)")
+    axes[0, 2].set_title("Controls (u)")
+    axes[0, 3].set_title(touch_sensor_names[0] if len(touch_sensor_names) else "Contacts (c)")
+
+    show_legends = (len(idxs) <= 6)
+
+    for i in range(nrows):
+        ax_q, ax_v, ax_u, ax_c = axes[i, 0], axes[i, 1], axes[i, 2], axes[i, 3]
+
+        # q[i]
+        if i < q_traj.shape[2]:
+            for idx in idxs:
+                ax_q.plot(t_state, q_traj[idx, :, i], alpha=alpha_traj, label=f"traj {idx}")
+            ax_q.set_ylabel(f"q[{i}]"); ax_q.grid(True, alpha=0.3)
+            if show_legends and i == 0: ax_q.legend(frameon=False, loc="best")
+        else:
+            ax_q.axis("off")
+
+        # v[i]
+        if i < v_traj.shape[2]:
+            for idx in idxs:
+                ax_v.plot(t_state, v_traj[idx, :, i], alpha=alpha_traj)
+            ax_v.set_ylabel(f"v[{i}]"); ax_v.grid(True, alpha=0.3)
         else:
             ax_v.axis("off")
 
-        # --- Column 2: u[i] (hide if i >= nu) ---
-        if i < nu:
-            for _ in range(n_plot):
-                idx = np.random.randint(batch_size)
-                ax_u.plot(t_input, u_traj[idx, :, i], alpha=0.5)
-            ax_u.set_ylabel(f"u[{i}]")
-            ax_u.grid(True, alpha=0.3)
-            if i == 0:
-                ax_u.set_title("Controls (u)")
+        # u[i]
+        if i < u_traj.shape[2]:
+            for idx in idxs:
+                ax_u.plot(t_input, u_traj[idx, :, i], alpha=alpha_traj)
+            ax_u.set_ylabel(f"u[{i}]"); ax_u.grid(True, alpha=0.3)
         else:
             ax_u.axis("off")
 
-    # x-label only on bottom row
-    for ax in axes[-1, :]:
+        # c[i]
+        if i < c_traj_plot.shape[2]:
+            for idx in idxs:
+                ax_c.plot(t_contact, c_traj_plot[idx, :, i], alpha=alpha_traj)
+            ax_c.set_ylabel(f"c[{i}]"); ax_c.grid(True, alpha=0.3)
+        else:
+            ax_c.axis("off")
+
+    for ax in axes.ravel():
         ax.set_xlabel("Time [s]")
+        ax.tick_params(labelbottom=True)
 
     plt.tight_layout()
     plt.show()
 
-    # plot the phase for each variable
-    fig, axes = plt.subplots(nrows=nq, ncols=1, figsize=(7, 2.2 * nq), sharex=True)
-    if nq == 1:
-        axes = axes[None, :]  # ensure 2D indexing when nq == 1 
-    for i in range(nq):
+    # ---------------------------
+    # Phase plots (same alpha)
+    # ---------------------------
+    fig, axes = plt.subplots(nrows=q_traj.shape[2], ncols=1, figsize=(7, 2.6 * q_traj.shape[2]), sharex=False)
+    if q_traj.shape[2] == 1:
+        axes = np.array([axes])
+
+    for i in range(q_traj.shape[2]):
         ax = axes[i]
-        if i < nv:
-            for _ in range(n_plot):
-                idx = np.random.randint(batch_size)
-                ax.plot(q_traj[idx, :, i], v_traj[idx, :, i], alpha=0.5)
-            ax.set_xlabel(f"q[{i}]")
-            ax.set_ylabel(f"v[{i}]")
-            ax.grid(True, alpha=0.3)
-            ax.set_title(f"Phase Plot: q[{i}] vs v[{i}]")
+        if i < v_traj.shape[2]:
+            for idx in idxs:
+                ax.plot(q_traj[idx, :, i], v_traj[idx, :, i], alpha=alpha_traj, label=f"traj {idx}")
+            ax.set_xlabel(f"q[{i}]"); ax.set_ylabel(f"v[{i}]")
+            ax.set_title(f"Phase Plot: q[{i}] vs v[{i}]"); ax.grid(True, alpha=0.3)
+            if show_legends and i == 0: ax.legend(frameon=False, loc="best")
         else:
             ax.axis("off")
+
     plt.tight_layout()
     plt.show()
